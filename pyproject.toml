@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mijn-ista-api"
-version = "0.1.0"
+version = "0.1.1"
 description = "Async Python client for the mijn.ista.nl energy portal"
 readme = "README.md"
 license = { text = "MIT" }
@@ -22,9 +22,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/aalaei/ha-mijn-ista"
-"Issue Tracker" = "https://github.com/aalaei/ha-mijn-ista/issues"
-Source = "https://github.com/aalaei/ha-mijn-ista/tree/main/python-mijn-ista"
+Homepage = "https://github.com/aalaei/mijn-ista-api"
+"Issue Tracker" = "https://github.com/aalaei/mijn-ista-api/issues"
+Source = "https://github.com/aalaei/mijn-ista-api"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mijn_ista_api"]
