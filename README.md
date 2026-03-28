@@ -81,7 +81,7 @@ except MijnIstaConnectionError:
 
 ## Home Assistant integration
 
-This library powers the [ista Nederland](https://github.com/aalaei/ha-mijn-ista-api) Home Assistant custom integration.
+This library powers the [ista Nederland](https://github.com/aalaei/ha-mijn-ista) Home Assistant custom integration.
 
 ## License
 
