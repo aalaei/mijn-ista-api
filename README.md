@@ -1,11 +1,11 @@
-# mijn-ista
+# mijn-ista-api
 
 Async Python client for the [mijn.ista.nl](https://mijn.ista.nl) energy monitoring portal.
 
 ## Installation
 
 ```bash
-pip install mijn-ista
+pip install mijn-ista-api
 ```
 
 ## Requirements
@@ -18,7 +18,7 @@ pip install mijn-ista
 ```python
 import asyncio
 import aiohttp
-from mijn_ista import MijnIstaAPI, MijnIstaAuthError, MijnIstaConnectionError
+from mijn_ista_api import MijnIstaAPI, MijnIstaAuthError, MijnIstaConnectionError
 
 async def main():
     async with aiohttp.ClientSession() as session:
@@ -60,7 +60,7 @@ asyncio.run(main())
 ## Error handling
 
 ```python
-from mijn_ista import MijnIstaAuthError, MijnIstaConnectionError
+from mijn_ista_api import MijnIstaAuthError, MijnIstaConnectionError
 
 try:
     await api.authenticate()
@@ -81,7 +81,7 @@ except MijnIstaConnectionError:
 
 ## Home Assistant integration
 
-This library powers the [ista Nederland](https://github.com/aalaei/ha-mijn-ista) Home Assistant custom integration.
+This library powers the [ista Nederland](https://github.com/aalaei/ha-mijn-ista-api) Home Assistant custom integration.
 
 ## License
 
