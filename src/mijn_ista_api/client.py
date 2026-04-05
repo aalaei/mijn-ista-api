@@ -109,28 +109,33 @@ class MijnIstaAPI:
     async def get_month_values(self, cuid: str) -> dict[str, Any]:
         """POST /api/Consumption/MonthValues, polling until all shards are loaded.
 
-        The API streams data in shards (hs = loaded, sh = total). We poll
-        every 2 seconds until hs >= sh, up to _MONTH_SHARD_MAX_POLLS times.
-
-        Shard poll iterations use _poll_shard (no retry) — 425 means "not ready
-        yet" and the sleep+loop already handles the wait. Using _post here would
-        multiply the timeout: MAX_POLLS × MAX_RETRIES × 30s ≈ 30 minutes.
+        The API streams data in shards (hs = loaded, sh = total) and may return
+        425 on the very first request when data is not yet ready. All attempts
+        use _poll_shard (no retry) — the loop itself handles the wait-and-retry
+        cycle. We poll every _MONTH_SHARD_DELAY seconds, up to
+        _MONTH_SHARD_MAX_POLLS times total.
         """
-        data = await self._post(_MONTH_VALUES, {"Cuid": cuid})
+        data: dict[str, Any] = {}
 
-        for _ in range(_MONTH_SHARD_MAX_POLLS):
-            sh = data.get("sh", 0)
-            hs = data.get("hs", 0)
-            if sh == 0 or hs >= sh:
-                break
-            _LOGGER.debug(
-                "mijn.ista.nl: MonthValues loading shard %d/%d, waiting %ds",
-                hs, sh, _MONTH_SHARD_DELAY,
-            )
-            await asyncio.sleep(_MONTH_SHARD_DELAY)
+        for attempt in range(_MONTH_SHARD_MAX_POLLS):
             polled = await self._poll_shard(_MONTH_VALUES, {"Cuid": cuid})
             if polled is not None:
                 data = polled
+                sh = data.get("sh", 0)
+                hs = data.get("hs", 0)
+                if sh > 0 and hs >= sh:
+                    break
+                _LOGGER.debug(
+                    "mijn.ista.nl: MonthValues loading shard %d/%d, waiting %ds",
+                    hs, sh, _MONTH_SHARD_DELAY,
+                )
+            else:
+                _LOGGER.debug(
+                    "mijn.ista.nl: MonthValues not ready (attempt %d), waiting %ds",
+                    attempt + 1, _MONTH_SHARD_DELAY,
+                )
+            if attempt < _MONTH_SHARD_MAX_POLLS - 1:
+                await asyncio.sleep(_MONTH_SHARD_DELAY)
 
         return data
 
