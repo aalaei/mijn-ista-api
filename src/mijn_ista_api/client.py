@@ -21,11 +21,13 @@ _CONSUMPTION_AVERAGES = "/api/Values/ConsumptionAverages"
 _TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 # MonthValues streams data in shards; poll until hs >= sh.
-_MONTH_SHARD_MAX_POLLS = 15
+# Shard polls use a no-retry path — 425 means "not ready yet" (handled by the
+# sleep+loop), so we must NOT run the full backoff retry on each poll.
+_MONTH_SHARD_MAX_POLLS = 8
 _MONTH_SHARD_DELAY = 2  # seconds between shard polls
 
-# Transient server errors that warrant a retry with backoff.
-_RETRY_STATUSES = {425, 503}
+# Transient server errors that warrant a retry with backoff (non-shard paths only).
+_RETRY_STATUSES = {503}
 _MAX_RETRIES = 3  # retries after the first attempt (4 total)
 
 
@@ -108,7 +110,11 @@ class MijnIstaAPI:
         """POST /api/Consumption/MonthValues, polling until all shards are loaded.
 
         The API streams data in shards (hs = loaded, sh = total). We poll
-        every 2 seconds until hs >= sh, up to 15 times.
+        every 2 seconds until hs >= sh, up to _MONTH_SHARD_MAX_POLLS times.
+
+        Shard poll iterations use _poll_shard (no retry) — 425 means "not ready
+        yet" and the sleep+loop already handles the wait. Using _post here would
+        multiply the timeout: MAX_POLLS × MAX_RETRIES × 30s ≈ 30 minutes.
         """
         data = await self._post(_MONTH_VALUES, {"Cuid": cuid})
 
@@ -122,7 +128,9 @@ class MijnIstaAPI:
                 hs, sh, _MONTH_SHARD_DELAY,
             )
             await asyncio.sleep(_MONTH_SHARD_DELAY)
-            data = await self._post(_MONTH_VALUES, {"Cuid": cuid})
+            polled = await self._poll_shard(_MONTH_VALUES, {"Cuid": cuid})
+            if polled is not None:
+                data = polled
 
         return data
 
@@ -185,8 +193,39 @@ class MijnIstaAPI:
         _LOGGER.debug("mijn.ista.nl: JWTRefresh failed, falling back to full re-auth")
         await self.authenticate()
 
+    async def _poll_shard(
+        self, path: str, extra: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Single POST with no retry logic, used exclusively for shard polling.
+
+        Returns the parsed response dict, or None if the server is not ready
+        (4xx other than 401) or a network error occurs. The caller's loop
+        handles the wait-and-retry cycle.
+        """
+        try:
+            async with self._session.post(
+                f"{BASE_URL}{path}",
+                json=self._body(extra),
+                timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 401:
+                    await self._refresh_jwt()
+                    return None  # caller will retry on next shard poll
+                if not resp.ok:
+                    _LOGGER.debug(
+                        "mijn.ista.nl: shard poll returned HTTP %d, will retry",
+                        resp.status,
+                    )
+                    return None
+                data: dict[str, Any] = await resp.json()
+                self._absorb_jwt(data)
+                return data
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            _LOGGER.debug("mijn.ista.nl: shard poll network error: %s", exc)
+            return None
+
     async def _post(self, path: str, extra: dict[str, Any]) -> dict[str, Any]:
-        """POST with exponential-backoff retry on 425/503 and re-auth on 401."""
+        """POST with exponential-backoff retry on 503 and re-auth on 401."""
         url = f"{BASE_URL}{path}"
         try:
             for attempt in range(_MAX_RETRIES + 1):
