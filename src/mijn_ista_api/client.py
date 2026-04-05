@@ -23,7 +23,7 @@ _TIMEOUT = aiohttp.ClientTimeout(total=30)
 # MonthValues streams data in shards; poll until hs >= sh.
 # Shard polls use a no-retry path — 425 means "not ready yet" (handled by the
 # sleep+loop), so we must NOT run the full backoff retry on each poll.
-_MONTH_SHARD_MAX_POLLS = 12
+_MONTH_SHARD_MAX_POLLS = 45
 _MONTH_SHARD_DELAY = 2  # seconds between shard polls
 
 # Transient server errors that warrant a retry with backoff (non-shard paths only).
