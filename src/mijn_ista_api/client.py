@@ -23,7 +23,7 @@ _TIMEOUT = aiohttp.ClientTimeout(total=30)
 # MonthValues streams data in shards; poll until hs >= sh.
 # Shard polls use a no-retry path — 425 means "not ready yet" (handled by the
 # sleep+loop), so we must NOT run the full backoff retry on each poll.
-_MONTH_SHARD_MAX_POLLS = 8
+_MONTH_SHARD_MAX_POLLS = 12
 _MONTH_SHARD_DELAY = 2  # seconds between shard polls
 
 # Transient server errors that warrant a retry with backoff (non-shard paths only).
@@ -216,13 +216,18 @@ class MijnIstaAPI:
                 if resp.status == 401:
                     await self._refresh_jwt()
                     return None  # caller will retry on next shard poll
-                if not resp.ok:
+                if resp.status not in {200, 425}:
                     _LOGGER.debug(
                         "mijn.ista.nl: shard poll returned HTTP %d, will retry",
                         resp.status,
                     )
                     return None
-                data: dict[str, Any] = await resp.json()
+                # Read body even on 425 — the server includes shard metadata
+                # (hs/sh fields) so the loop can track progress.
+                try:
+                    data: dict[str, Any] = await resp.json()
+                except Exception:
+                    return None
                 self._absorb_jwt(data)
                 return data
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
