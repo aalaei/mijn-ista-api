@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 import aiohttp
@@ -20,10 +21,12 @@ _CONSUMPTION_AVERAGES = "/api/Values/ConsumptionAverages"
 
 _TIMEOUT = aiohttp.ClientTimeout(total=30)
 
-# MonthValues streams data in shards; poll until hs >= sh.
-# Shard polls use a no-retry path — 425 means "not ready yet" (handled by the
-# sleep+loop), so we must NOT run the full backoff retry on each poll.
-_MONTH_SHARD_MAX_POLLS = 45
+# MonthValues streams data in shards; poll until hs >= sh or time budget expires.
+# The server loads ~0.3 shards/s and may have 20+ shards (months of history).
+# We use a time budget so callers get a predictable upper bound regardless of
+# how many shards the server has. The most recent month loads first, so even
+# a partial result is enough for all "Month" sensors.
+_MONTH_SHARD_BUDGET_S = 60  # wall-clock seconds to spend loading shards
 _MONTH_SHARD_DELAY = 2  # seconds between shard polls
 
 # Transient server errors that warrant a retry with backoff (non-shard paths only).
@@ -107,26 +110,33 @@ class MijnIstaAPI:
         return await self._post(_USER_VALUES, {})
 
     async def get_month_values(self, cuid: str) -> dict[str, Any]:
-        """POST /api/Consumption/MonthValues, polling until all shards are loaded.
+        """POST /api/Consumption/MonthValues, polling until shards are loaded.
 
         The API streams data in shards (hs = loaded, sh = total) and may return
         425 on the very first request when data is not yet ready. All attempts
-        use _poll_shard (no retry) — the loop itself handles the wait-and-retry
-        cycle. We poll every _MONTH_SHARD_DELAY seconds, up to
-        _MONTH_SHARD_MAX_POLLS times total.
+        use _poll_shard (no retry) — the loop itself handles the wait-and-retry.
+
+        Polling stops when all shards are loaded OR the time budget expires.
+        The most recent month always loads first, so even a partial result
+        is sufficient for all current-month sensors.
         """
         data: dict[str, Any] = {}
+        deadline = time.monotonic() + _MONTH_SHARD_BUDGET_S
+        attempt = 0
 
-        for attempt in range(_MONTH_SHARD_MAX_POLLS):
+        while time.monotonic() < deadline:
             polled = await self._poll_shard(_MONTH_VALUES, {"Cuid": cuid})
             if polled is not None:
                 data = polled
                 sh = data.get("sh", 0)
                 hs = data.get("hs", 0)
                 if sh > 0 and hs >= sh:
+                    _LOGGER.debug(
+                        "mijn.ista.nl: MonthValues complete (%d shards)", sh
+                    )
                     break
                 _LOGGER.debug(
-                    "mijn.ista.nl: MonthValues loading shard %d/%d, waiting %ds",
+                    "mijn.ista.nl: MonthValues shard %d/%d, waiting %ds",
                     hs, sh, _MONTH_SHARD_DELAY,
                 )
             else:
@@ -134,8 +144,15 @@ class MijnIstaAPI:
                     "mijn.ista.nl: MonthValues not ready (attempt %d), waiting %ds",
                     attempt + 1, _MONTH_SHARD_DELAY,
                 )
-            if attempt < _MONTH_SHARD_MAX_POLLS - 1:
-                await asyncio.sleep(_MONTH_SHARD_DELAY)
+            attempt += 1
+            await asyncio.sleep(_MONTH_SHARD_DELAY)
+
+        if data.get("sh", 0) > data.get("hs", 0):
+            _LOGGER.warning(
+                "mijn.ista.nl: MonthValues time budget exceeded, "
+                "returning %d/%d shards for %s",
+                data.get("hs", 0), data.get("sh", 0), cuid,
+            )
 
         return data
 
