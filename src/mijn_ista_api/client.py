@@ -26,7 +26,8 @@ _TIMEOUT = aiohttp.ClientTimeout(total=30)
 # We use a time budget so callers get a predictable upper bound regardless of
 # how many shards the server has. The most recent month loads first, so even
 # a partial result is enough for all "Month" sensors.
-_MONTH_SHARD_BUDGET_S = 60  # wall-clock seconds to spend loading shards
+_MONTH_SHARD_BUDGET_S = 60       # full mode: wait for complete history
+_MONTH_SHARD_BUDGET_QUICK_S = 15  # quick mode: just enough for first useful shard
 _MONTH_SHARD_DELAY = 2  # seconds between shard polls
 
 # Transient server errors that warrant a retry with backoff (non-shard paths only).
@@ -109,19 +110,23 @@ class MijnIstaAPI:
         """
         return await self._post(_USER_VALUES, {})
 
-    async def get_month_values(self, cuid: str) -> dict[str, Any]:
+    async def get_month_values(
+        self, cuid: str, *, quick: bool = False
+    ) -> dict[str, Any]:
         """POST /api/Consumption/MonthValues, polling until shards are loaded.
 
         The API streams data in shards (hs = loaded, sh = total) and may return
         425 on the very first request when data is not yet ready. All attempts
         use _poll_shard (no retry) — the loop itself handles the wait-and-retry.
 
-        Polling stops when all shards are loaded OR the time budget expires.
-        The most recent month always loads first, so even a partial result
-        is sufficient for all current-month sensors.
+        When ``quick=True`` the call returns as soon as the first response with
+        any mc entries arrives (≤ 15 s). This is used during HA startup so the
+        integration does not block Home Assistant for a full minute. Subsequent
+        coordinator refreshes use ``quick=False`` (default) for complete history.
         """
+        budget = _MONTH_SHARD_BUDGET_QUICK_S if quick else _MONTH_SHARD_BUDGET_S
         data: dict[str, Any] = {}
-        deadline = time.monotonic() + _MONTH_SHARD_BUDGET_S
+        deadline = time.monotonic() + budget
         attempt = 0
 
         while time.monotonic() < deadline:
@@ -133,6 +138,13 @@ class MijnIstaAPI:
                 if sh > 0 and hs >= sh:
                     _LOGGER.debug(
                         "mijn.ista.nl: MonthValues complete (%d shards)", sh
+                    )
+                    break
+                if quick and data.get("mc"):
+                    _LOGGER.debug(
+                        "mijn.ista.nl: MonthValues quick mode done "
+                        "(%d mc entries, shard %d/%d)",
+                        len(data["mc"]), hs, sh,
                     )
                     break
                 _LOGGER.debug(
@@ -147,7 +159,7 @@ class MijnIstaAPI:
             attempt += 1
             await asyncio.sleep(_MONTH_SHARD_DELAY)
 
-        if data.get("sh", 0) > data.get("hs", 0):
+        if not quick and data.get("sh", 0) > data.get("hs", 0):
             _LOGGER.warning(
                 "mijn.ista.nl: MonthValues time budget exceeded, "
                 "returning %d/%d shards for %s",
