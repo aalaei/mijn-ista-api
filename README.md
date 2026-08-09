@@ -24,7 +24,7 @@ async def main():
     async with aiohttp.ClientSession() as session:
         api = MijnIstaAPI(session, "you@example.com", "your-password", lang="nl-NL")
 
-        # Authenticate (obtains JWT)
+        # Log in (OpenID Connect flow against login.ista.com)
         await api.authenticate()
 
         # Fetch account + annual comparison data
@@ -51,7 +51,7 @@ asyncio.run(main())
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `authenticate()` | `POST /api/Authorization/Authorize` | Obtain JWT |
+| `authenticate()` | OIDC login via `login.ista.com` | Establish an authenticated session |
 | `get_user_values()` | `POST /api/Values/UserValues` | Account info, annual comparison |
 | `get_month_values(cuid)` | `POST /api/Consumption/MonthValues` | Full monthly history (auto-polls shards) |
 | `get_consumption_values(cuid, billing_period)` | `POST /api/Values/ConsumptionValues` | Meter totals for one billing year |
@@ -74,10 +74,15 @@ except MijnIstaConnectionError:
 
 ## Notes
 
-- The JWT is passed in the **request body**, not as an `Authorization` header.
-- Every API response returns a refreshed JWT; the client handles this automatically.
+- `authenticate()` drives a full OpenID Connect Authorization Code + PKCE login against ista's
+  Keycloak instance (`login.ista.com`), the same flow the website itself uses. It establishes an
+  ASP.NET Core session cookie (held by the `aiohttp.ClientSession` you provide) plus a CSRF token
+  that every data call must include; there is no bearer token to manage yourself.
+- Accounts with two-factor authentication enabled are not supported — the login form fill-in
+  assumes a single username/password step.
+- A 401 from any data endpoint triggers a full re-login (`authenticate()`) followed by one retry.
 - `get_month_values` polls until the server has loaded all data shards (the API streams results).
-- Transient `425 Too Early` / `503 Service Unavailable` responses are retried with exponential backoff.
+- Transient `503 Service Unavailable` responses are retried with exponential backoff.
 
 ## Home Assistant integration
 

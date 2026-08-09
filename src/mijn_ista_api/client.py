@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+import re
 import time
 from typing import Any
 
@@ -12,14 +14,24 @@ import aiohttp
 _LOGGER = logging.getLogger(__name__)
 
 BASE_URL = "https://mijn.ista.nl"
-_AUTHORIZE = "/api/Authorization/Authorize"
-_JWT_REFRESH = "/api/Authorization/JWTRefresh"
+_HOME_LOGIN = "/home/login"
+_HOME_PAGE = "/Home"
 _USER_VALUES = "/api/Values/UserValues"
 _MONTH_VALUES = "/api/Consumption/MonthValues"
 _CONSUMPTION_VALUES = "/api/Values/ConsumptionValues"
 _CONSUMPTION_AVERAGES = "/api/Values/ConsumptionAverages"
 
 _TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+# mijn.ista.nl authenticates through an OpenID Connect (Keycloak) login at
+# login.ista.com, not through a bearer token issued by the app itself. Every
+# data endpoint still expects an `Authorization: Bearer` header to be present,
+# but the value is never actually validated by the server — it's the same
+# fixed placeholder the site's own frontend hardcodes ("i want a tasty
+# cookie", base64-encoded). Real authorization comes from the ASP.NET Core
+# session cookie plus the CSRF header below; this header just has to exist.
+_PLACEHOLDER_BEARER = "Bearer aSB3YW50IGEgdGFzdHkgY29va2ll"
+_CSRF_HEADER = "x-csrf-token-ista-nl_tp"
 
 # MonthValues streams data in shards; poll until hs >= sh or time budget expires.
 # The server loads ~0.3 shards/s and may have 20+ shards (months of history).
@@ -43,12 +55,23 @@ class MijnIstaConnectionError(Exception):
     """Raised when the API cannot be reached."""
 
 
+def _extract(pattern: str, text: str, flags: int = 0) -> str | None:
+    m = re.search(pattern, text, flags)
+    return html.unescape(m.group(1)) if m else None
+
+
 class MijnIstaAPI:
     """Async HTTP client for mijn.ista.nl.
 
-    Authentication uses a custom JWT that is passed in the request body
-    (not as an Authorization header). Every response carries a refreshed
-    JWT that must replace the stored one for the next call.
+    Authentication is an OpenID Connect Authorization Code + PKCE flow
+    against ista's Keycloak instance (login.ista.com). The PKCE code
+    verifier and the OIDC state/nonce are generated and tracked entirely
+    server-side by mijn.ista.nl (tied to short-lived cookies set during the
+    challenge) — this client only needs to carry cookies through the
+    redirect chain and submit the Keycloak login form, exactly like a
+    browser without JavaScript would. The result is an ASP.NET Core
+    identity session cookie (held in the shared aiohttp session's cookie
+    jar) plus a CSRF token that must accompany every data request.
     """
 
     def __init__(
@@ -62,43 +85,109 @@ class MijnIstaAPI:
         self._username = username
         self._password = password
         self._lang = lang
-        self._jwt: str | None = None
+        self._csrf_token: str | None = None
 
     # ── authentication ──────────────────────────────────────────────────────
 
     async def authenticate(self) -> None:
-        """Obtain a fresh JWT from /api/Authorization/Authorize.
+        """Log in via the OIDC flow and establish the session cookie + CSRF token.
 
         Raises MijnIstaAuthError on bad credentials,
-        MijnIstaConnectionError on network failure.
+        MijnIstaConnectionError on network failure or an unexpected response.
         """
         try:
-            async with self._session.post(
-                f"{BASE_URL}{_AUTHORIZE}",
-                json={
-                    "username": self._username,
-                    "password": self._password,
-                    "LANG": self._lang,
+            # Priming request: establishes the load-balancer affinity cookie
+            # that /home/login's challenge redirect depends on.
+            async with self._session.get(f"{BASE_URL}/", timeout=_TIMEOUT):
+                pass
+
+            async with self._session.get(
+                f"{BASE_URL}{_HOME_LOGIN}",
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": f"{BASE_URL}/",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Site": "same-origin",
                 },
                 timeout=_TIMEOUT,
+                allow_redirects=False,
             ) as resp:
-                if resp.status == 400:
-                    raise MijnIstaAuthError("Invalid credentials (HTTP 400)")
-                resp.raise_for_status()
-                data: dict[str, Any] = await resp.json()
+                authorize_url = resp.headers.get("Location")
+                if resp.status != 302 or not authorize_url:
+                    raise MijnIstaConnectionError(
+                        f"Unexpected response starting login (HTTP {resp.status})"
+                    )
+
+            async with self._session.get(authorize_url, timeout=_TIMEOUT) as resp:
+                login_html = await resp.text()
+
+            form_action = _extract(
+                r'<form[^>]+id="kc-form-login"[^>]+action="([^"]+)"', login_html
+            )
+            if not form_action:
+                raise MijnIstaConnectionError(
+                    "Could not find the identity provider's login form"
+                )
+
+            async with self._session.post(
+                form_action,
+                data={
+                    "username": self._username,
+                    "password": self._password,
+                    "credentialId": "",
+                },
+                timeout=_TIMEOUT,
+                allow_redirects=False,
+            ) as resp:
+                body = await resp.text()
+
+            if 'id="kc-form-login"' in body:
+                raise MijnIstaAuthError("Invalid credentials")
+
+            callback_action = _extract(r'ACTION="([^"]+)"', body)
+            callback_fields = {
+                k: html.unescape(v)
+                for k, v in re.findall(r'NAME="([^"]+)" VALUE="([^"]*)"', body)
+            }
+            if not callback_action or "code" not in callback_fields:
+                raise MijnIstaConnectionError(
+                    "Unexpected response from the identity provider"
+                )
+
+            async with self._session.post(
+                callback_action,
+                data=callback_fields,
+                timeout=_TIMEOUT,
+                allow_redirects=False,
+            ) as resp:
+                if resp.status not in (302, 303):
+                    raise MijnIstaConnectionError(
+                        f"Session callback failed (HTTP {resp.status})"
+                    )
+
+            await self._refresh_csrf_token()
+
         except MijnIstaAuthError:
             raise
-        except aiohttp.ClientResponseError as exc:
-            if exc.status == 400:
-                raise MijnIstaAuthError("Invalid credentials") from exc
-            raise MijnIstaConnectionError(str(exc)) from exc
+        except MijnIstaConnectionError:
+            raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise MijnIstaConnectionError(str(exc)) from exc
 
-        if "JWT" not in data:
-            raise MijnIstaAuthError("No JWT field in /Authorize response")
-        self._jwt = data["JWT"]
         _LOGGER.debug("mijn.ista.nl: authenticated successfully")
+
+    async def _refresh_csrf_token(self) -> None:
+        """Fetch the CSRF token every data POST must carry, from the dashboard page."""
+        async with self._session.get(f"{BASE_URL}{_HOME_PAGE}", timeout=_TIMEOUT) as resp:
+            if resp.status != 200:
+                raise MijnIstaAuthError("Session was not accepted after login")
+            page_html = await resp.text()
+
+        token = _extract(r'<meta name="csrf-token" content="([^"]+)"', page_html)
+        if not token:
+            raise MijnIstaConnectionError("Could not find CSRF token on dashboard page")
+        self._csrf_token = token
 
     # ── data endpoints ──────────────────────────────────────────────────────
 
@@ -197,35 +286,14 @@ class MijnIstaAPI:
     # ── internals ───────────────────────────────────────────────────────────
 
     def _body(self, extra: dict[str, Any]) -> dict[str, Any]:
-        """Build a request body with JWT + LANG merged with caller extras."""
-        return {"JWT": self._jwt, "LANG": self._lang, **extra}
+        """Build a request body with LANG merged with caller extras."""
+        return {"LANG": self._lang, **extra}
 
-    def _absorb_jwt(self, data: dict[str, Any]) -> None:
-        """Persist the refreshed JWT that every API response carries."""
-        if refreshed := data.get("JWT"):
-            self._jwt = refreshed
-
-    async def _refresh_jwt(self) -> None:
-        """Refresh JWT via /api/Authorization/JWTRefresh.
-
-        Falls back to a full re-authentication if the refresh endpoint fails.
-        """
-        try:
-            async with self._session.post(
-                f"{BASE_URL}{_JWT_REFRESH}",
-                json={"JWT": self._jwt, "LANG": self._lang},
-                timeout=_TIMEOUT,
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if new_jwt := data.get("JWT"):
-                        self._jwt = new_jwt
-                        _LOGGER.debug("mijn.ista.nl: JWT refreshed via JWTRefresh")
-                        return
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            pass
-        _LOGGER.debug("mijn.ista.nl: JWTRefresh failed, falling back to full re-auth")
-        await self.authenticate()
+    def _auth_headers(self) -> dict[str, str]:
+        headers = {"Authorization": _PLACEHOLDER_BEARER}
+        if self._csrf_token:
+            headers[_CSRF_HEADER] = self._csrf_token
+        return headers
 
     async def _poll_shard(
         self, path: str, extra: dict[str, Any]
@@ -240,10 +308,11 @@ class MijnIstaAPI:
             async with self._session.post(
                 f"{BASE_URL}{path}",
                 json=self._body(extra),
+                headers=self._auth_headers(),
                 timeout=_TIMEOUT,
             ) as resp:
                 if resp.status == 401:
-                    await self._refresh_jwt()
+                    await self.authenticate()
                     return None  # caller will retry on next shard poll
                 if resp.status not in {200, 425}:
                     _LOGGER.debug(
@@ -257,7 +326,6 @@ class MijnIstaAPI:
                     data: dict[str, Any] = await resp.json()
                 except Exception:
                     return None
-                self._absorb_jwt(data)
                 return data
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             _LOGGER.debug("mijn.ista.nl: shard poll network error: %s", exc)
@@ -269,7 +337,10 @@ class MijnIstaAPI:
         try:
             for attempt in range(_MAX_RETRIES + 1):
                 async with self._session.post(
-                    url, json=self._body(extra), timeout=_TIMEOUT
+                    url,
+                    json=self._body(extra),
+                    headers=self._auth_headers(),
+                    timeout=_TIMEOUT,
                 ) as resp:
                     if resp.status in _RETRY_STATUSES and attempt < _MAX_RETRIES:
                         wait = 3 * (attempt + 1)
@@ -280,19 +351,18 @@ class MijnIstaAPI:
                         await asyncio.sleep(wait)
                         continue
                     if resp.status == 401:
-                        _LOGGER.debug("mijn.ista.nl: JWT expired, refreshing")
-                        await self._refresh_jwt()
+                        _LOGGER.debug("mijn.ista.nl: session expired, re-authenticating")
+                        await self.authenticate()
                         async with self._session.post(
-                            url, json=self._body(extra), timeout=_TIMEOUT
+                            url,
+                            json=self._body(extra),
+                            headers=self._auth_headers(),
+                            timeout=_TIMEOUT,
                         ) as retry:
                             retry.raise_for_status()
-                            data: dict[str, Any] = await retry.json()
-                            self._absorb_jwt(data)
-                            return data
+                            return await retry.json()
                     resp.raise_for_status()
-                    data = await resp.json()
-                    self._absorb_jwt(data)
-                    return data
+                    return await resp.json()
         except MijnIstaAuthError:
             raise
         except MijnIstaConnectionError:
