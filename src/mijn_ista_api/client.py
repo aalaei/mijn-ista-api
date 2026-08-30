@@ -96,6 +96,18 @@ class MijnIstaAPI:
         MijnIstaConnectionError on network failure or an unexpected response.
         """
         try:
+            # Start every login from a clean slate. The session is shared and
+            # long-lived (Home Assistant hands the same aiohttp session to all
+            # integrations), so cookies from an earlier login survive into the
+            # next call. With an ista session cookie still in the jar the
+            # priming request below no longer serves the landing page — it
+            # redirects into the portal's sign-out flow, whose
+            # /signout-callback-oidc leg answers 403 and leaves the session
+            # wedged, so /home/login answers 403 as well. Only ista's own
+            # domains are dropped, never another integration's cookies.
+            self._session.cookie_jar.clear_domain("ista.nl")
+            self._session.cookie_jar.clear_domain("ista.com")
+
             # Priming request: establishes the load-balancer affinity cookie
             # that /home/login's challenge redirect depends on.
             async with self._session.get(f"{BASE_URL}/", timeout=_TIMEOUT):
