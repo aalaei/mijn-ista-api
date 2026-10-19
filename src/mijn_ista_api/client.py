@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 import aiohttp
+from yarl import URL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,6 +46,9 @@ _MONTH_SHARD_DELAY = 2  # seconds between shard polls
 # Transient server errors that warrant a retry with backoff (non-shard paths only).
 _RETRY_STATUSES = {503}
 _MAX_RETRIES = 3  # retries after the first attempt (4 total)
+
+# Redirect hops allowed after the OIDC callback (normally 2).
+_MAX_LOGIN_REDIRECTS = 10
 
 
 class MijnIstaAuthError(Exception):
@@ -120,14 +124,17 @@ class MijnIstaAPI:
                     )
 
             async with self._session.get(authorize_url, timeout=_TIMEOUT) as resp:
+                login_status = resp.status
                 login_html = await resp.text()
 
             form_action = _extract(
                 r'<form[^>]+id="kc-form-login"[^>]+action="([^"]+)"', login_html
             )
             if not form_action:
+                title = _extract(r"<title>\s*(.*?)\s*</title>", login_html, re.S)
                 raise MijnIstaConnectionError(
-                    "Could not find the identity provider's login form"
+                    "Could not find the identity provider's login form "
+                    f"(HTTP {login_status}, page title: {title!r})"
                 )
 
             async with self._session.post(
@@ -158,16 +165,33 @@ class MijnIstaAPI:
             # The callback sets the identity cookie and redirects through
             # /home/login to /Home, which sets further session cookies
             # (MijnistaLogon, ista_nl_tp_twj). Follow the whole chain like a
-            # browser would; skipping it leaves the session unusable.
+            # browser would; skipping it leaves the session unusable. The
+            # hops are followed by hand so each one carries the cookies the
+            # previous one just set (see _cookies_for).
             async with self._session.post(
                 callback_action,
                 data=callback_fields,
                 timeout=_TIMEOUT,
+                allow_redirects=False,
             ) as resp:
-                if resp.status != 200:
-                    raise MijnIstaConnectionError(
-                        f"Session callback failed (HTTP {resp.status})"
-                    )
+                status = resp.status
+                next_url = resp.headers.get("Location")
+            for _ in range(_MAX_LOGIN_REDIRECTS):
+                if status not in (301, 302, 303, 307, 308) or not next_url:
+                    break
+                url = str(URL(callback_action).join(URL(next_url)))
+                async with self._session.get(
+                    url,
+                    cookies=self._cookies_for(url),
+                    timeout=_TIMEOUT,
+                    allow_redirects=False,
+                ) as resp:
+                    status = resp.status
+                    next_url = resp.headers.get("Location")
+            if status != 200:
+                raise MijnIstaConnectionError(
+                    f"Session callback failed (HTTP {status})"
+                )
 
             await self._refresh_csrf_token()
 
@@ -182,7 +206,10 @@ class MijnIstaAPI:
 
     async def _refresh_csrf_token(self) -> None:
         """Fetch the CSRF token every data POST must carry, from the dashboard page."""
-        async with self._session.get(f"{BASE_URL}{_HOME_PAGE}", timeout=_TIMEOUT) as resp:
+        url = f"{BASE_URL}{_HOME_PAGE}"
+        async with self._session.get(
+            url, cookies=self._cookies_for(url), timeout=_TIMEOUT
+        ) as resp:
             if resp.status != 200:
                 raise MijnIstaAuthError(
                     f"Session was not accepted after login (HTTP {resp.status})"
@@ -294,6 +321,29 @@ class MijnIstaAPI:
         """Build a request body with LANG merged with caller extras."""
         return {"LANG": self._lang, **extra}
 
+    def _cookies_for(self, url: str) -> dict[str, str]:
+        """Return every jar cookie that applies to ``url``.
+
+        aiohttp >= 3.14.4 silently drops cookies from a request once its
+        Cookie header would exceed 8190 bytes. ASP.NET splits mijn.ista.nl's
+        session cookie into ~4 KB chunks (.AspNetCore.Cookies, ...C1, ...C2,
+        ...), which together exceed that, so the server sees a truncated
+        session and answers 401. Cookies passed per request are exempt from
+        that cap, so every mijn.ista.nl request passes them explicitly.
+        """
+        target = URL(url)
+        host = target.host or ""
+        path = target.path or "/"
+        cookies: dict[str, str] = {}
+        for morsel in self._session.cookie_jar:
+            domain = morsel["domain"].lstrip(".")
+            if domain and host != domain and not host.endswith(f".{domain}"):
+                continue
+            if not path.startswith(morsel["path"] or "/"):
+                continue
+            cookies[morsel.key] = morsel.value
+        return cookies
+
     def _auth_headers(self) -> dict[str, str]:
         headers = {"Authorization": _PLACEHOLDER_BEARER}
         if self._csrf_token:
@@ -314,6 +364,7 @@ class MijnIstaAPI:
                 f"{BASE_URL}{path}",
                 json=self._body(extra),
                 headers=self._auth_headers(),
+                cookies=self._cookies_for(f"{BASE_URL}{path}"),
                 timeout=_TIMEOUT,
             ) as resp:
                 if resp.status == 401:
@@ -345,6 +396,7 @@ class MijnIstaAPI:
                     url,
                     json=self._body(extra),
                     headers=self._auth_headers(),
+                    cookies=self._cookies_for(url),
                     timeout=_TIMEOUT,
                 ) as resp:
                     if resp.status in _RETRY_STATUSES and attempt < _MAX_RETRIES:
@@ -362,6 +414,7 @@ class MijnIstaAPI:
                             url,
                             json=self._body(extra),
                             headers=self._auth_headers(),
+                            cookies=self._cookies_for(url),
                             timeout=_TIMEOUT,
                         ) as retry:
                             retry.raise_for_status()
