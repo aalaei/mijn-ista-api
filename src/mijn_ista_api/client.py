@@ -155,13 +155,16 @@ class MijnIstaAPI:
                     "Unexpected response from the identity provider"
                 )
 
+            # The callback sets the identity cookie and redirects through
+            # /home/login to /Home, which sets further session cookies
+            # (MijnistaLogon, ista_nl_tp_twj). Follow the whole chain like a
+            # browser would; skipping it leaves the session unusable.
             async with self._session.post(
                 callback_action,
                 data=callback_fields,
                 timeout=_TIMEOUT,
-                allow_redirects=False,
             ) as resp:
-                if resp.status not in (302, 303):
+                if resp.status != 200:
                     raise MijnIstaConnectionError(
                         f"Session callback failed (HTTP {resp.status})"
                     )
@@ -181,7 +184,9 @@ class MijnIstaAPI:
         """Fetch the CSRF token every data POST must carry, from the dashboard page."""
         async with self._session.get(f"{BASE_URL}{_HOME_PAGE}", timeout=_TIMEOUT) as resp:
             if resp.status != 200:
-                raise MijnIstaAuthError("Session was not accepted after login")
+                raise MijnIstaAuthError(
+                    f"Session was not accepted after login (HTTP {resp.status})"
+                )
             page_html = await resp.text()
 
         token = _extract(r'<meta name="csrf-token" content="([^"]+)"', page_html)
